@@ -122,7 +122,8 @@ class SessionManager {
         if (!sock.authState.creds.registered && phoneNumber) {
             await new Promise(r => setTimeout(r, 2000));
             try {
-                const code = await sock.requestPairingCode(phoneNumber.replace(/\D/g, ''));
+                const rawCode = await sock.requestPairingCode(phoneNumber.replace(/\D/g, ''));
+const code = rawCode.match(/.{1,4}/g).join('-');
                 this.io.to(sessionId).emit('pairing_code', { code });
                 this._updateStatus(sessionId, 'pairing');
                 return { success: true, code };
