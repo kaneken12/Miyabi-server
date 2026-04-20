@@ -50,6 +50,7 @@ this.phoneIndex = new Map(); // phone → sessionId
             phone: phoneNumber,
             createdAt: Date.now()
         });
+this.phoneIndex.set(phoneNumber, sessionId);
 
         // ── Events de connexion ──
         sock.ev.on('connection.update', async (update) => {
