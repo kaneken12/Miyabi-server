@@ -149,6 +149,9 @@ const code = rawCode.match(/.{1,4}/g).join('-');
         activeSessions.delete(sessionId);
 
         // Supprimer les fichiers de session
+const session = activeSessions.get(sessionId);
+if (session?.phone) this.phoneIndex.delete(session.phone);
+
         const sessionPath = path.join(SESSIONS_DIR, sessionId);
         if (fs.existsSync(sessionPath)) {
             fs.rmSync(sessionPath, { recursive: true, force: true });
