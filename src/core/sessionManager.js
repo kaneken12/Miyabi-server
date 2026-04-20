@@ -18,6 +18,7 @@ class SessionManager {
     constructor(io) {
         this.io = io; // Socket.io pour envoyer les events au frontend
     }
+this.phoneIndex = new Map(); // phone → sessionId
 
     // ──────────────────────────────────────────────
     // Créer ou reprendre une session
