@@ -4,25 +4,19 @@ const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
 
-// Import des handlers Miyabi
 const messageHandler = require('../../src/handlers/messageHandler');
-const personality = require('../../src/core/personality');
 
 const SESSIONS_DIR = path.join(__dirname, '../../sessions');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-// Map des sessions actives : sessionId → { sock, status, phone }
 const activeSessions = new Map();
 
 class SessionManager {
     constructor(io) {
-        this.io = io; // Socket.io pour envoyer les events au frontend
+        this.io = io;
+        this.phoneIndex = new Map();
     }
-this.phoneIndex = new Map(); // phone → sessionId
 
-    // ──────────────────────────────────────────────
-    // Créer ou reprendre une session
-    // ──────────────────────────────────────────────
     async createSession(sessionId, phoneNumber) {
         if (activeSessions.has(sessionId)) {
             const existing = activeSessions.get(sessionId);
@@ -43,21 +37,19 @@ this.phoneIndex = new Map(); // phone → sessionId
             browser: ['Miyabi Bot', 'Chrome', '120.0.0']
         });
 
-        // Stocker la session
         activeSessions.set(sessionId, {
             sock,
             status: 'pending',
             phone: phoneNumber,
             createdAt: Date.now()
         });
-this.phoneIndex.set(phoneNumber, sessionId);
 
-        // ── Events de connexion ──
+        this.phoneIndex.set(phoneNumber, sessionId);
+
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
-                // Envoyer le QR code au frontend via Socket.io
                 this.io.to(sessionId).emit('qr', { qr });
                 this._updateStatus(sessionId, 'qr_ready');
             }
@@ -65,52 +57,61 @@ this.phoneIndex.set(phoneNumber, sessionId);
             if (connection === 'open') {
                 this._updateStatus(sessionId, 'connected');
                 this.io.to(sessionId).emit('connected', {
-                    message: '✅ Miyabi est connectée !',
+                    message: 'Miyabi est connectee !',
                     phone: phoneNumber
                 });
 
-                // Message de bienvenue à l'utilisateur
                 try {
-                    await sock.sendMessage(`${phoneNumber}@s.whatsapp.net`, {
-                        text: `...Je suis là. T'as payé pour ça alors je vais faire mon travail. Envoie-moi un message pour commencer.`
+                    await sock.sendMessage(phoneNumber + '@s.whatsapp.net', {
+                        text: "...Je suis la. T'as paye pour ca alors je vais faire mon travail. Envoie-moi un message pour commencer."
                     });
                 } catch (e) {}
             }
 
             if (connection === 'close') {
-                const code = (lastDisconnect?.error instanceof Boom)
-                    ? lastDisconnect.error.output?.statusCode : null;
+                var statusCode = null;
+                if (lastDisconnect && lastDisconnect.error instanceof Boom) {
+                    statusCode = lastDisconnect.error.output.statusCode;
+                }
 
-                if (code === DisconnectReason.loggedOut) {
+                if (statusCode === DisconnectReason.loggedOut) {
                     this._updateStatus(sessionId, 'logged_out');
                     this.io.to(sessionId).emit('disconnected', { reason: 'logged_out' });
                     this.deleteSession(sessionId);
                 } else {
                     this._updateStatus(sessionId, 'reconnecting');
                     this.io.to(sessionId).emit('reconnecting');
-                    setTimeout(() => this.createSession(sessionId, phoneNumber), 5000);
+                    var self = this;
+                    setTimeout(function() {
+                        self.createSession(sessionId, phoneNumber);
+                    }, 5000);
                 }
             }
         });
 
-        // ── Messages entrants ──
-        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        sock.ev.on('messages.upsert', async function(data) {
+            var messages = data.messages;
+            var type = data.type;
             if (type !== 'notify') return;
-            for (const msg of messages) {
+            for (var i = 0; i < messages.length; i++) {
+                var msg = messages[i];
                 if (msg.key.fromMe) continue;
-                const isGroup = msg.key.remoteJid?.endsWith('@g.us');
+                var isGroup = msg.key.remoteJid && msg.key.remoteJid.endsWith('@g.us');
                 await messageHandler.handleMessage(sock, msg, isGroup);
             }
         });
 
-        // ── Nouveaux membres groupe ──
-        sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
+        sock.ev.on('group-participants.update', async function(data) {
+            var id = data.id;
+            var participants = data.participants;
+            var action = data.action;
             if (action === 'add') {
-                for (const participant of participants) {
-                    const number = participant.split('@')[0];
+                for (var i = 0; i < participants.length; i++) {
+                    var participant = participants[i];
+                    var number = participant.split('@')[0];
                     try {
                         await sock.sendMessage(id, {
-                            text: `@${number} a rejoint. ...Bienvenue, j'imagine.`,
+                            text: '@' + number + ' a rejoint. ...Bienvenue, j\'imagine.',
                             mentions: [participant]
                         });
                     } catch (e) {}
@@ -120,17 +121,17 @@ this.phoneIndex.set(phoneNumber, sessionId);
 
         sock.ev.on('creds.update', saveCreds);
 
-        // ── Demander le pairing code si pas encore enregistré ──
         if (!sock.authState.creds.registered && phoneNumber) {
-            await new Promise(r => setTimeout(r, 2000));
+            await new Promise(function(r) { setTimeout(r, 2000); });
             try {
-                const rawCode = await sock.requestPairingCode(phoneNumber.replace(/\D/g, ''));
-const code = rawCode.match(/.{1,4}/g).join('-');
-                this.io.to(sessionId).emit('pairing_code', { code });
+                var rawCode = await sock.requestPairingCode(phoneNumber.replace(/\D/g, ''));
+                // Formater en XXXX-XXXX
+                var code = rawCode.match(/.{1,4}/g).join('-');
+                this.io.to(sessionId).emit('pairing_code', { code: code });
                 this._updateStatus(sessionId, 'pairing');
-                return { success: true, code };
+                return { success: true, code: code };
             } catch (error) {
-                this.io.to(sessionId).emit('error', { message: 'Numéro invalide ou déjà connecté.' });
+                this.io.to(sessionId).emit('error', { message: 'Numero invalide ou deja connecte.' });
                 return { success: false, error: error.message };
             }
         }
@@ -138,21 +139,17 @@ const code = rawCode.match(/.{1,4}/g).join('-');
         return { success: true };
     }
 
-    // ──────────────────────────────────────────────
-    // Supprimer une session (déconnexion)
-    // ──────────────────────────────────────────────
     deleteSession(sessionId) {
-        const session = activeSessions.get(sessionId);
-        if (session?.sock) {
+        var session = activeSessions.get(sessionId);
+        if (session && session.sock) {
             try { session.sock.end(); } catch (e) {}
         }
         activeSessions.delete(sessionId);
+        if (session && session.phone) {
+            this.phoneIndex.delete(session.phone);
+        }
 
-        // Supprimer les fichiers de session
-const session = activeSessions.get(sessionId);
-if (session?.phone) this.phoneIndex.delete(session.phone);
-
-        const sessionPath = path.join(SESSIONS_DIR, sessionId);
+        var sessionPath = path.join(SESSIONS_DIR, sessionId);
         if (fs.existsSync(sessionPath)) {
             fs.rmSync(sessionPath, { recursive: true, force: true });
         }
@@ -163,21 +160,23 @@ if (session?.phone) this.phoneIndex.delete(session.phone);
     }
 
     getStatus(sessionId) {
-        return activeSessions.get(sessionId)?.status || 'not_found';
+        var session = activeSessions.get(sessionId);
+        return session ? session.status : 'not_found';
     }
 
     _updateStatus(sessionId, status) {
-        const session = activeSessions.get(sessionId);
+        var session = activeSessions.get(sessionId);
         if (session) {
             session.status = status;
             activeSessions.set(sessionId, session);
         }
     }
 
-    // Nettoyer les sessions inactives depuis + de 10 min
     cleanupStaleSessions() {
-        const now = Date.now();
-        for (const [id, session] of activeSessions.entries()) {
+        var now = Date.now();
+        for (var entry of activeSessions.entries()) {
+            var id = entry[0];
+            var session = entry[1];
             if (session.status === 'pending' && now - session.createdAt > 600000) {
                 this.deleteSession(id);
             }
