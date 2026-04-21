@@ -34,7 +34,7 @@ class SessionManager {
             printQRInTerminal: false,
             auth: state,
             logger: pino({ level: 'silent' }),
-            browser: ['Miyabi Bot', 'Chrome', '120.0.0']
+            browser: ['Ubuntu', 'Chrome', '20.0.04']
         });
 
         activeSessions.set(sessionId, {
