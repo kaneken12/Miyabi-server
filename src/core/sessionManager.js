@@ -122,7 +122,7 @@ class SessionManager {
         sock.ev.on('creds.update', saveCreds);
 
         if (!sock.authState.creds.registered && phoneNumber) {
-            await new Promise(function(r) { setTimeout(r, 2000); });
+            await new Promise(function(r) { setTimeout(r, 5000); });
             try {
                 var rawCode = await sock.requestPairingCode(phoneNumber.replace(/\D/g, ''));
                 // Formater en XXXX-XXXX
