@@ -10,7 +10,7 @@
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^6.7.0",
+    "@whiskeysockets/baileys": "6.5.0",
     "axios": "^1.6.0",
     "cheerio": "^1.0.0",
     "cors": "^2.8.5",
