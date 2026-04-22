@@ -131,9 +131,10 @@ class SessionManager {
                 this._updateStatus(sessionId, 'pairing');
                 return { success: true, code: code };
             } catch (error) {
-                this.io.to(sessionId).emit('error', { message: 'Numero invalide ou deja connecte.' });
-                return { success: false, error: error.message };
-            }
+    console.error('PAIRING ERROR:', error);
+    this.io.to(sessionId).emit('error', { message: error.message || 'Erreur inconnue' });
+    return { success: false, error: error.message };
+}
         }
 
         return { success: true };
