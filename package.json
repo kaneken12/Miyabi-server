@@ -10,7 +10,7 @@
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "6.5.0",
+    "@whiskeysockets/baileys": "^6.7.0",
     "axios": "^1.6.0",
     "cheerio": "^1.0.0",
     "cors": "^2.8.5",
@@ -19,7 +19,7 @@
     "fluent-ffmpeg": "^2.1.2",
     "node-cache": "^5.1.2",
     "pino": "^8.17.2",
-    "sharp": "^0.33.1",
+    "sharp": "^0.32.0",
     "socket.io": "^4.6.1",
     "yt-dlp-wrap": "^2.3.12"
   },
