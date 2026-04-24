@@ -32,13 +32,14 @@ class SessionManager {
         var state = authData.state;
         var saveCreds = authData.saveCreds;
 
-        var sock = makeWASocket({
-            printQRInTerminal: false,
-            auth: state,
-            logger: pino({ level: 'silent' }),
-            browser: ['Ubuntu', 'Chrome', '20.0.04']
-        });
-
+        var versionData = await fetchLatestWaVersion();
+var sock = makeWASocket({
+    version: versionData.version,
+    printQRInTerminal: false,
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    browser: ['Ubuntu', 'Chrome', '20.0.04']
+});
         activeSessions.set(sessionId, {
             sock: sock,
             status: 'pending',
