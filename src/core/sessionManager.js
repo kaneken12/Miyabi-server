@@ -1,166 +1,152 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
 
+// Import des handlers Miyabi
 const messageHandler = require('../../src/handlers/messageHandler');
+const personality = require('../../src/core/personality');
 
 const SESSIONS_DIR = path.join(__dirname, '../../sessions');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
+// Map des sessions actives : sessionId → { sock, status, phone }
 const activeSessions = new Map();
 
 class SessionManager {
     constructor(io) {
-        this.io = io;
-        this.phoneIndex = new Map();
+        this.io = io; // Socket.io pour envoyer les events au frontend
     }
 
+    // ──────────────────────────────────────────────
+    // Créer ou reprendre une session
+    // ──────────────────────────────────────────────
     async createSession(sessionId, phoneNumber) {
         if (activeSessions.has(sessionId)) {
-            var existing = activeSessions.get(sessionId);
+            const existing = activeSessions.get(sessionId);
             if (existing.status === 'connected') {
                 return { success: false, error: 'already_connected' };
             }
         }
 
-        var sessionPath = path.join(SESSIONS_DIR, sessionId);
+        const sessionPath = path.join(SESSIONS_DIR, sessionId);
         if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true });
 
-        var authData = await useMultiFileAuthState(sessionPath);
-        var state = authData.state;
-        var saveCreds = authData.saveCreds;
+        const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
-        var versionData = await fetchLatestWaVersion();
-var sock = makeWASocket({
-    version: versionData.version,
-    printQRInTerminal: false,
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    browser: ['Ubuntu', 'Chrome', '20.0.04']
-});
+        const sock = makeWASocket({
+            printQRInTerminal: false,
+            auth: state,
+            logger: pino({ level: 'silent' }),
+            browser: ['Miyabi Bot', 'Chrome', '120.0.0']
+        });
+
+        // Stocker la session
         activeSessions.set(sessionId, {
-            sock: sock,
+            sock,
             status: 'pending',
             phone: phoneNumber,
             createdAt: Date.now()
         });
 
-        this.phoneIndex.set(phoneNumber, sessionId);
+        // ── Events de connexion ──
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
 
-        var self = this;
-        var codeSent = false;
-
-        // ── Pairing code : demander dès que Baileys commence à se connecter ──
-        if (!sock.authState.creds.registered && phoneNumber) {
-            sock.ev.on('connection.update', async function(update) {
-                var connection = update.connection;
-                var qr = update.qr;
-
-                if ((connection === 'connecting' || qr) && !codeSent) {
-                    codeSent = true;
-                    await new Promise(function(r) { setTimeout(r, 3000); });
-                    try {
-                        var rawCode = await sock.requestPairingCode(
-                            phoneNumber.replace(/\D/g, '')
-                        );
-                        var code = rawCode.match(/.{1,4}/g).join('-');
-                        console.log('Code genere:', code);
-                        self.io.to(sessionId).emit('pairing_code', { code: code });
-                        self._updateStatus(sessionId, 'pairing');
-                    } catch (error) {
-                        console.error('PAIRING ERROR:', error.message);
-                        self.io.to(sessionId).emit('error', {
-                            message: 'Echec du code. Reessaie dans 30 secondes.'
-                        });
-                    }
-                }
-            });
-        }
-
-        // ── Events connexion ──
-        sock.ev.on('connection.update', async function(update) {
-            var connection = update.connection;
-            var lastDisconnect = update.lastDisconnect;
+            if (qr) {
+                // Envoyer le QR code au frontend via Socket.io
+                this.io.to(sessionId).emit('qr', { qr });
+                this._updateStatus(sessionId, 'qr_ready');
+            }
 
             if (connection === 'open') {
-                self._updateStatus(sessionId, 'connected');
-                self.io.to(sessionId).emit('connected', {
-                    message: 'Miyabi est connectee !',
+                this._updateStatus(sessionId, 'connected');
+                this.io.to(sessionId).emit('connected', {
+                    message: '✅ Miyabi est connectée !',
                     phone: phoneNumber
                 });
+
+                // Message de bienvenue à l'utilisateur
                 try {
-                    await sock.sendMessage(phoneNumber + '@s.whatsapp.net', {
-                        text: "...Je suis la. Envoie-moi un message pour commencer."
+                    await sock.sendMessage(`${phoneNumber}@s.whatsapp.net`, {
+                        text: `...Je suis là. T'as payé pour ça alors je vais faire mon travail. Envoie-moi un message pour commencer.`
                     });
-                } catch (e) {
-                    console.error('Message bienvenue echoue:', e.message);
-                }
+                } catch (e) {}
             }
 
             if (connection === 'close') {
-                var statusCode = null;
-                if (lastDisconnect && lastDisconnect.error && lastDisconnect.error instanceof Boom) {
-                    statusCode = lastDisconnect.error.output.statusCode;
-                }
-                console.log('Connexion fermee, code:', statusCode);
+                const code = (lastDisconnect?.error instanceof Boom)
+                    ? lastDisconnect.error.output?.statusCode : null;
 
-                if (statusCode === DisconnectReason.loggedOut) {
-                    self._updateStatus(sessionId, 'logged_out');
-                    self.io.to(sessionId).emit('disconnected', { reason: 'logged_out' });
-                    self.deleteSession(sessionId);
+                if (code === DisconnectReason.loggedOut) {
+                    this._updateStatus(sessionId, 'logged_out');
+                    this.io.to(sessionId).emit('disconnected', { reason: 'logged_out' });
+                    this.deleteSession(sessionId);
                 } else {
-                    self._updateStatus(sessionId, 'reconnecting');
-                    self.io.to(sessionId).emit('reconnecting');
-                    setTimeout(function() {
-                        self.createSession(sessionId, phoneNumber);
-                    }, 5000);
+                    this._updateStatus(sessionId, 'reconnecting');
+                    this.io.to(sessionId).emit('reconnecting');
+                    setTimeout(() => this.createSession(sessionId, phoneNumber), 5000);
                 }
             }
         });
 
         // ── Messages entrants ──
-        sock.ev.on('messages.upsert', async function(data) {
-            if (data.type !== 'notify') return;
-            for (var i = 0; i < data.messages.length; i++) {
-                var msg = data.messages[i];
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return;
+            for (const msg of messages) {
                 if (msg.key.fromMe) continue;
-                var isGroup = msg.key.remoteJid && msg.key.remoteJid.endsWith('@g.us');
+                const isGroup = msg.key.remoteJid?.endsWith('@g.us');
                 await messageHandler.handleMessage(sock, msg, isGroup);
             }
         });
 
         // ── Nouveaux membres groupe ──
-        sock.ev.on('group-participants.update', async function(data) {
-            if (data.action !== 'add') return;
-            for (var i = 0; i < data.participants.length; i++) {
-                var participant = data.participants[i];
-                var number = participant.split('@')[0];
-                try {
-                    await sock.sendMessage(data.id, {
-                        text: '@' + number + " a rejoint. ...Bienvenue, j'imagine.",
-                        mentions: [participant]
-                    });
-                } catch (e) {}
+        sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
+            if (action === 'add') {
+                for (const participant of participants) {
+                    const number = participant.split('@')[0];
+                    try {
+                        await sock.sendMessage(id, {
+                            text: `@${number} a rejoint. ...Bienvenue, j'imagine.`,
+                            mentions: [participant]
+                        });
+                    } catch (e) {}
+                }
             }
         });
 
         sock.ev.on('creds.update', saveCreds);
 
+        // ── Demander le pairing code si pas encore enregistré ──
+        if (!sock.authState.creds.registered && phoneNumber) {
+            await new Promise(r => setTimeout(r, 2000));
+            try {
+                const code = await sock.requestPairingCode(phoneNumber.replace(/\D/g, ''));
+                this.io.to(sessionId).emit('pairing_code', { code });
+                this._updateStatus(sessionId, 'pairing');
+                return { success: true, code };
+            } catch (error) {
+                this.io.to(sessionId).emit('error', { message: 'Numéro invalide ou déjà connecté.' });
+                return { success: false, error: error.message };
+            }
+        }
+
         return { success: true };
     }
 
+    // ──────────────────────────────────────────────
+    // Supprimer une session (déconnexion)
+    // ──────────────────────────────────────────────
     deleteSession(sessionId) {
-        var session = activeSessions.get(sessionId);
-        if (session && session.sock) {
+        const session = activeSessions.get(sessionId);
+        if (session?.sock) {
             try { session.sock.end(); } catch (e) {}
         }
         activeSessions.delete(sessionId);
-        if (session && session.phone) {
-            this.phoneIndex.delete(session.phone);
-        }
-        var sessionPath = path.join(SESSIONS_DIR, sessionId);
+
+        // Supprimer les fichiers de session
+        const sessionPath = path.join(SESSIONS_DIR, sessionId);
         if (fs.existsSync(sessionPath)) {
             fs.rmSync(sessionPath, { recursive: true, force: true });
         }
@@ -171,23 +157,21 @@ var sock = makeWASocket({
     }
 
     getStatus(sessionId) {
-        var session = activeSessions.get(sessionId);
-        return session ? session.status : 'not_found';
+        return activeSessions.get(sessionId)?.status || 'not_found';
     }
 
     _updateStatus(sessionId, status) {
-        var session = activeSessions.get(sessionId);
+        const session = activeSessions.get(sessionId);
         if (session) {
             session.status = status;
             activeSessions.set(sessionId, session);
         }
     }
 
+    // Nettoyer les sessions inactives depuis + de 10 min
     cleanupStaleSessions() {
-        var now = Date.now();
-        for (var entry of activeSessions.entries()) {
-            var id = entry[0];
-            var session = entry[1];
+        const now = Date.now();
+        for (const [id, session] of activeSessions.entries()) {
             if (session.status === 'pending' && now - session.createdAt > 600000) {
                 this.deleteSession(id);
             }
