@@ -33,13 +33,14 @@ class SessionManager {
         const sessionPath = path.join(SESSIONS_DIR, sessionId);
         if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true });
 
-        const {version} = await fetchLatestWaVersion;
+        // Initialiser l'authentification avec Baileys
+        const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
         const sock = makeWASocket({
             printQRInTerminal: false,
             auth: state,
             logger: pino({ level: 'silent' }),
-            browser: ['Miyabi Bot', 'Ubuntu', '120.0.0']
+            browser: ['Ubuntu', 'Chrome', '20.0.4']
         });
 
         // Stocker la session
