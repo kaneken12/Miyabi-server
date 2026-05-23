@@ -1,12 +1,12 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
 
 // Import des handlers Miyabi
-const messageHandler = require('../../src/handlers/messageHandler');
-const personality = require('../../src/core/personality');
+const messageHandler = require('../handlers/messageHandler');
+const personality = require('./personality');
 
 const SESSIONS_DIR = path.join(__dirname, '../../sessions');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
@@ -28,6 +28,9 @@ class SessionManager {
             if (existing.status === 'connected') {
                 return { success: false, error: 'already_connected' };
             }
+
+            try { existing.sock?.end(); } catch (e) {}
+            activeSessions.delete(sessionId);
         }
 
         const sessionPath = path.join(SESSIONS_DIR, sessionId);
@@ -39,7 +42,8 @@ class SessionManager {
             printQRInTerminal: false,
             auth: state,
             logger: pino({ level: 'silent' }),
-            browser: ['Miyabi Bot', 'Chrome', '120.0.0']
+            browser: Browsers.ubuntu('Chrome'),
+            qrTimeout: 60_000 // 60 secondes pour le code d'appairage
         });
 
         // Stocker la session
@@ -47,6 +51,8 @@ class SessionManager {
             sock,
             status: 'pending',
             phone: phoneNumber,
+            pairingCode: null,
+            pairingCodeExpiresAt: null,
             createdAt: Date.now()
         });
 
@@ -62,6 +68,7 @@ class SessionManager {
 
             if (connection === 'open') {
                 this._updateStatus(sessionId, 'connected');
+                this._updatePairingCode(sessionId, null);
                 this.io.to(sessionId).emit('connected', {
                     message: '✅ Miyabi est connectée !',
                     phone: phoneNumber
@@ -76,6 +83,9 @@ class SessionManager {
             }
 
             if (connection === 'close') {
+                const currentSession = activeSessions.get(sessionId);
+                if (currentSession?.sock !== sock) return;
+
                 const code = (lastDisconnect?.error instanceof Boom)
                     ? lastDisconnect.error.output?.statusCode : null;
 
@@ -119,15 +129,42 @@ class SessionManager {
         sock.ev.on('creds.update', saveCreds);
 
         // ── Demander le pairing code si pas encore enregistré ──
-        if (!sock.authState.creds.registered && phoneNumber) {
+        // Vérifier si on a déjà des credentials enregistrés
+        const hasCreds = fs.existsSync(path.join(sessionPath, 'creds.json'));
+
+        if (!hasCreds && phoneNumber) {
             await new Promise(r => setTimeout(r, 2000));
             try {
-                const code = await sock.requestPairingCode(phoneNumber.replace(/\D/g, ''));
+                const cleanPhone = phoneNumber.replace(/\D/g, '');
+                const code = await sock.requestPairingCode(cleanPhone);
+                this._updatePairingCode(sessionId, code, 180000);
                 this.io.to(sessionId).emit('pairing_code', { code });
                 this._updateStatus(sessionId, 'pairing');
+                
+                // Attendre la connexion avec timeout de 3 minutes
+                try {
+                    await sock.waitForConnectionUpdate(
+                        async (update) => update.connection === 'open',
+                        180000
+                    );
+                    this._updateStatus(sessionId, 'connected');
+                    this.io.to(sessionId).emit('pairing_success');
+                } catch (timeoutError) {
+                    this._updateStatus(sessionId, 'pairing_failed');
+                    this.io.to(sessionId).emit('error', { 
+                        message: 'Timeout: Le code d\'appairage n\'a pas été confirmé après 3 minutes. Relance une connexion pour générer un nouveau code.' 
+                    });
+                    this.deleteSession(sessionId);
+                    return { success: false, error: 'pairing_timeout' };
+                }
+                
                 return { success: true, code };
             } catch (error) {
-                this.io.to(sessionId).emit('error', { message: 'Numéro invalide ou déjà connecté.' });
+                this._updateStatus(sessionId, 'pairing_failed');
+                this.io.to(sessionId).emit('error', {
+                    message: `Appairage impossible: ${error.message || 'numéro invalide ou déjà connecté.'}`
+                });
+                this.deleteSession(sessionId);
                 return { success: false, error: error.message };
             }
         }
@@ -140,10 +177,11 @@ class SessionManager {
     // ──────────────────────────────────────────────
     deleteSession(sessionId) {
         const session = activeSessions.get(sessionId);
+        activeSessions.delete(sessionId);
+
         if (session?.sock) {
             try { session.sock.end(); } catch (e) {}
         }
-        activeSessions.delete(sessionId);
 
         // Supprimer les fichiers de session
         const sessionPath = path.join(SESSIONS_DIR, sessionId);
@@ -160,10 +198,41 @@ class SessionManager {
         return activeSessions.get(sessionId)?.status || 'not_found';
     }
 
+    replaySessionState(sessionId, socket) {
+        const session = activeSessions.get(sessionId);
+        if (!session) return false;
+
+        const payload = { status: session.status };
+        const pairingCodeIsValid = session.pairingCode &&
+            session.pairingCodeExpiresAt &&
+            Date.now() < session.pairingCodeExpiresAt;
+
+        if (pairingCodeIsValid) {
+            payload.pairingCode = session.pairingCode;
+        }
+
+        socket.emit('status_update', payload);
+
+        if (pairingCodeIsValid) {
+            socket.emit('pairing_code', { code: session.pairingCode });
+        }
+
+        return true;
+    }
+
     _updateStatus(sessionId, status) {
         const session = activeSessions.get(sessionId);
         if (session) {
             session.status = status;
+            activeSessions.set(sessionId, session);
+        }
+    }
+
+    _updatePairingCode(sessionId, code, ttlMs = 0) {
+        const session = activeSessions.get(sessionId);
+        if (session) {
+            session.pairingCode = code;
+            session.pairingCodeExpiresAt = code ? Date.now() + ttlMs : null;
             activeSessions.set(sessionId, session);
         }
     }

@@ -30,7 +30,7 @@ class MessageHandler {
 
             // En groupe: répondre seulement si mentionné ou si "miyabi" dans le texte
             if (isGroup) {
-                const botMentioned = this._isBotMentioned(message);
+                const botMentioned = this._isBotMentioned(message, sock);
                 const nameMentioned = messageText.toLowerCase().includes('miyabi');
                 if (!botMentioned && !nameMentioned && !isMother) return;
             }
@@ -294,11 +294,14 @@ class MessageHandler {
                '';
     }
 
-    _isBotMentioned(message) {
+    _isBotMentioned(message, sock) {
         const mentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid;
         if (!mentioned) return false;
-        // Vérifier si le JID du bot est dans les mentions
-        return mentioned.length > 0;
+
+        const botJid = sock.user?.id?.split(':')[0];
+        if (!botJid) return false;
+
+        return mentioned.some((jid) => jid.split(':')[0] === botJid);
     }
 
     async _sendText(sock, jid, text) {
