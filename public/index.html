@@ -26,11 +26,12 @@
         }
 
         html, body {
-            height: 100%;
+            min-height: 100%;
             background: var(--bg);
             color: var(--text);
             font-family: 'Outfit', sans-serif;
             overflow-x: hidden;
+            overflow-y: auto;
         }
 
         /* ── Background animé ── */
@@ -64,7 +65,7 @@
         .page {
             position: fixed; inset: 0; z-index: 1;
             display: flex; flex-direction: column;
-            align-items: center; justify-content: center;
+            align-items: center; justify-content: flex-start;
             padding: 2rem 1rem;
             overflow-y: auto;
         }
@@ -339,7 +340,7 @@
                 <div class="code-display" id="codeDisplay" style="display:none;">
                     <div class="code-label">Ton code</div>
                     <div class="code-value" id="codeValue">— — — —</div>
-                    <div class="code-expires">⏱ Valide 60 secondes</div>
+                    <div class="code-expires">⏱ Valide environ 3 minutes</div>
                 </div>
 
                 <div class="instructions">
@@ -437,23 +438,27 @@
         // ── State ──
         let socket = null;
         let currentSessionId = null;
+        let isConnecting = false;
 
         // ── Socket.io ──
         function initSocket() {
+            if (socket) return;
+
             socket = io();
 
             socket.on('pairing_code', ({ code }) => {
-                document.getElementById('codeValue').textContent = code;
-                document.getElementById('codeDisplay').style.display = 'block';
-                document.getElementById('statusWaiting').style.display = 'none';
+                showPairingCode(code);
             });
 
             socket.on('connected', () => {
+                isConnecting = false;
                 goToSection('sec-success');
                 setStep(3);
             });
 
             socket.on('reconnecting', () => {
+                goToSection('sec-code');
+                setStep(2);
                 updateStatus('Reconnexion en cours...', 'waiting');
             });
 
@@ -461,8 +466,25 @@
                 if (reason === 'logged_out') goBack();
             });
 
+            socket.on('status_update', ({ status, pairingCode }) => {
+                handleStatusUpdate(status);
+                if (pairingCode) showPairingCode(pairingCode);
+            });
+
             socket.on('error', ({ message }) => {
+                isConnecting = false;
                 showPhoneError(message);
+                resetPairingDisplay();
+                goToSection('sec-phone');
+                setStep(1);
+            });
+
+            socket.on('connect_error', () => {
+                if (!isConnecting && !currentSessionId) return;
+
+                isConnecting = false;
+                showPhoneError('Connexion temps réel impossible. Vérifie que le serveur tourne.');
+                resetPairingDisplay();
                 goToSection('sec-phone');
                 setStep(1);
             });
@@ -470,6 +492,8 @@
 
         // ── Connexion ──
         async function startConnection() {
+            if (isConnecting) return;
+
             const phone = document.getElementById('phoneInput').value.trim();
             hidePhoneError();
 
@@ -477,6 +501,10 @@
                 showPhoneError('Entre un numéro valide avec l\'indicatif pays (ex: 237XXXXXXXXX)');
                 return;
             }
+
+            isConnecting = true;
+            initSocket();
+            resetPairingDisplay();
 
             const btn = document.getElementById('btnConnect');
             btn.disabled = true;
@@ -492,14 +520,15 @@
 
                 if (data.success) {
                     currentSessionId = data.sessionId;
-                    if (!socket) initSocket();
                     socket.emit('join_session', currentSessionId);
                     goToSection('sec-code');
                     setStep(2);
                 } else {
+                    isConnecting = false;
                     showPhoneError(data.error || 'Erreur de connexion');
                 }
             } catch (err) {
+                isConnecting = false;
                 showPhoneError('Serveur inaccessible. Réessaie.');
             } finally {
                 btn.disabled = false;
@@ -508,6 +537,8 @@
         }
 
         function goBack() {
+            isConnecting = false;
+
             if (currentSessionId) {
                 fetch('/api/disconnect', {
                     method: 'POST',
@@ -516,9 +547,7 @@
                 }).catch(() => {});
                 currentSessionId = null;
             }
-            document.getElementById('codeDisplay').style.display = 'none';
-            document.getElementById('statusWaiting').style.display = 'flex';
-            document.getElementById('statusMsg').textContent = 'Génération du code...';
+            resetPairingDisplay();
             goToSection('sec-phone');
             setStep(1);
         }
@@ -538,8 +567,55 @@
 
         function updateStatus(msg, type) {
             const bar = document.getElementById('statusWaiting');
+            bar.style.display = 'flex';
+            document.getElementById('codeDisplay').style.display = 'none';
             bar.className = `status-bar ${type}`;
             document.getElementById('statusMsg').textContent = msg;
+        }
+
+        function showPairingCode(code) {
+            document.getElementById('codeValue').textContent = code;
+            document.getElementById('codeDisplay').style.display = 'block';
+            document.getElementById('statusWaiting').style.display = 'none';
+        }
+
+        function handleStatusUpdate(status) {
+            if (status === 'connected') {
+                isConnecting = false;
+                goToSection('sec-success');
+                setStep(3);
+                return;
+            }
+
+            if (status === 'pairing' || status === 'pending' || status === 'qr_ready') {
+                goToSection('sec-code');
+                setStep(2);
+                updateStatus('Génération du code...', 'waiting');
+                return;
+            }
+
+            if (status === 'reconnecting') {
+                goToSection('sec-code');
+                setStep(2);
+                updateStatus('Reconnexion en cours...', 'waiting');
+                return;
+            }
+
+            if (status === 'pairing_failed' || status === 'logged_out') {
+                isConnecting = false;
+                showPhoneError('Session expirée. Relance une connexion.');
+                resetPairingDisplay();
+                goToSection('sec-phone');
+                setStep(1);
+            }
+        }
+
+        function resetPairingDisplay() {
+            document.getElementById('codeValue').textContent = '— — — —';
+            document.getElementById('codeDisplay').style.display = 'none';
+            document.getElementById('statusWaiting').style.display = 'flex';
+            document.getElementById('statusWaiting').className = 'status-bar waiting';
+            document.getElementById('statusMsg').textContent = 'Génération du code...';
         }
 
         function showPhoneError(msg) {
@@ -555,6 +631,8 @@
         document.getElementById('phoneInput').addEventListener('keydown', e => {
             if (e.key === 'Enter') startConnection();
         });
+
+        initSocket();
     </script>
 </body>
 </html>

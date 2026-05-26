@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const readline = require('readline');
@@ -18,8 +18,9 @@ async function setupWhatsApp() {
         printQRInTerminal: false,
         auth: state,
         logger: pino({ level: 'silent' }),
-        browser: ['Miyabi Bot', 'Chrome', '120.0.0'],
-        generateHighQualityLinkPreview: true
+        browser: Browsers.ubuntu('Chrome'),
+        generateHighQualityLinkPreview: true,
+        qrTimeout: 60_000 // 60 secondes pour le pairing code
     });
 
     // ── Connexion ──
@@ -131,8 +132,17 @@ async function setupWhatsApp() {
             logger.info(`   Code d'appairage: ${code}`);
             logger.info(`🔐 ══════════════════════════`);
             logger.info('⚠️  WhatsApp > Appareils liés > Connecter un appareil > Entrer le code');
+            
+            // Attendre la connexion après l'appairage (timeout: 60 secondes)
+            logger.info('⏳ En attente de connexion avec le pairing code... (60 secondes max)');
+            await sock.waitForConnectionUpdate(
+                async (update) => update.connection === 'open',
+                60000
+            );
+            logger.info('✅ Appareil appairé et connecté avec succès!');
         } catch (error) {
-            logger.error('Erreur code appairage:', error.message);
+            logger.error('Erreur appairage:', error.message);
+            throw error;
         }
     }
 

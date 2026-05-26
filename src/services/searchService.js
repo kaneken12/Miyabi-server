@@ -84,21 +84,7 @@ class SearchService {
         if (!rawResults) return null;
 
         try {
-            const prompt = `Tu es Miyabi, bot WhatsApp tsundere et sarcastique.
-Humeur: ${emotion}
-Voici les résultats de recherche pour "${query}":
-
-${rawResults}
-
-Résume ces informations en 2-3 phrases claires et utiles.
-Garde ton style Miyabi: direct, un peu froid, sans émojis.
-Ne commence pas par "Alors" ou "Voilà".`;
-
-            const { GoogleGenerativeAI } = require('@google/generative-ai');
-            const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-            const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-            const result = await model.generateContent(prompt);
-            return result.response.text().trim();
+            return await gemini.generateSearchSummary(query, rawResults, emotion);
         } catch {
             // Si Gemini échoue, retourner les résultats bruts formatés
             return `Résultats pour "${query}":\n\n${rawResults.slice(0, 800)}`;

@@ -44,10 +44,7 @@ io.on('connection', (socket) => {
         console.log(`📡 Client ${socket.id} rejoint session: ${sessionId}`);
 
         // Envoyer le statut actuel si session existe déjà
-        const status = sessionManager.getStatus(sessionId);
-        if (status !== 'not_found') {
-            socket.emit('status_update', { status });
-        }
+        sessionManager.replaySessionState(sessionId, socket);
     });
 
     socket.on('disconnect', () => {

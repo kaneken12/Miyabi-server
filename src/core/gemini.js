@@ -4,9 +4,10 @@ const logger = require('../utils/logger');
 
 class GeminiAI {
     constructor() {
-        this.genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-        // gemini-1.5-flash : rapide, gratuit, parfait pour ce use case
-        this.model = this.genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+        this.apiKey = process.env.GEMINI_API_KEY;
+        this.modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+        this.genAI = this.apiKey ? new GoogleGenerativeAI(this.apiKey) : null;
+        this.model = this.genAI ? this.genAI.getGenerativeModel({ model: this.modelName }) : null;
         // Mémoire par utilisateur : Map<userId, messages[]>
         this.conversations = new Map();
     }
@@ -16,10 +17,19 @@ class GeminiAI {
     // Retourne un objet JSON structuré
     // ──────────────────────────────────────────────
     async detectIntent(message) {
+        const allowedIntents = new Set([
+            'CHAT',
+            'DOWNLOAD_AUDIO',
+            'DOWNLOAD_VIDEO',
+            'SEARCH_WEB',
+            'GROUP_ACTION',
+            'CONVERT_TO_AUDIO'
+        ]);
+
         const prompt = `Tu es un classificateur d'intentions pour un bot WhatsApp.
 Analyse ce message et retourne UNIQUEMENT un JSON valide, sans markdown, sans backticks.
 
-Message: "${message}"
+Message: ${JSON.stringify(String(message).slice(0, 2000))}
 
 Retourne ce format exact:
 {
@@ -42,11 +52,22 @@ Pour GROUP_ACTION, extrait l'action dans params.action et la cible dans params.t
 `;
 
         try {
-            const result = await this.model.generateContent(prompt);
-            const text = result.response.text().trim();
-            // Nettoyer au cas où Gemini ajoute des backticks malgré tout
-            const clean = text.replace(/```json|```/g, '').trim();
-            return JSON.parse(clean);
+            const text = await this._generateText(prompt, {
+                temperature: 0,
+                maxOutputTokens: 256,
+                responseMimeType: 'application/json'
+            });
+            const parsed = this._parseJsonObject(text);
+
+            if (!allowedIntents.has(parsed.intent)) {
+                throw new Error(`Intent inconnu: ${parsed.intent}`);
+            }
+
+            return {
+                intent: parsed.intent,
+                confidence: Number(parsed.confidence) || 0,
+                params: parsed.params && typeof parsed.params === 'object' ? parsed.params : {}
+            };
         } catch (error) {
             logger.warn('Fallback intent → CHAT:', error.message);
             return { intent: 'CHAT', confidence: 0.5, params: {} };
@@ -76,8 +97,10 @@ ${history.slice(-6).map(h => `${h.role === 'user' ? 'Utilisateur' : 'Miyabi'}: $
 Utilisateur: ${message}
 Miyabi:`;
 
-            const result = await this.model.generateContent(fullPrompt);
-            const response = result.response.text().trim();
+            const response = await this._generateText(fullPrompt, {
+                temperature: 0.8,
+                maxOutputTokens: 220
+            });
 
             // Sauvegarder dans l'historique
             history.push({ role: 'user', content: message });
@@ -113,8 +136,10 @@ ${actionTexts[actionType] || 'Annonce que tu exécutes la tâche.'}
 Réponds en une seule phrase courte, sans émojis, dans le style Miyabi.`;
 
         try {
-            const result = await this.model.generateContent(prompt);
-            return result.response.text().trim();
+            return await this._generateText(prompt, {
+                temperature: 0.7,
+                maxOutputTokens: 80
+            });
         } catch {
             return '...Je m\'en occupe.';
         }
@@ -135,11 +160,30 @@ ${errors[errorType] || 'Dis qu\'une erreur s\'est produite.'}
 Une seule phrase courte, sans émojis.`;
 
         try {
-            const result = await this.model.generateContent(prompt);
-            return result.response.text().trim();
+            return await this._generateText(prompt, {
+                temperature: 0.7,
+                maxOutputTokens: 80
+            });
         } catch {
             return '...Quelque chose a merdé. Réessaie.';
         }
+    }
+
+    async generateSearchSummary(query, rawResults, emotion) {
+        const prompt = `Tu es Miyabi, bot WhatsApp tsundere et sarcastique.
+Humeur: ${emotion}
+Voici les résultats de recherche pour ${JSON.stringify(String(query).slice(0, 300))}:
+
+${String(rawResults).slice(0, 4000)}
+
+Résume ces informations en 2-3 phrases claires et utiles.
+Garde ton style Miyabi: direct, un peu froid, sans émojis.
+Ne commence pas par "Alors" ou "Voilà".`;
+
+        return this._generateText(prompt, {
+            temperature: 0.6,
+            maxOutputTokens: 220
+        });
     }
 
     _buildSystemPrompt(emotion, isMother) {
@@ -159,6 +203,28 @@ Règles absolues:
 
     clearHistory(userId) {
         this.conversations.delete(userId);
+    }
+
+    async _generateText(prompt, generationConfig = {}) {
+        if (!this.model) {
+            throw new Error('GEMINI_API_KEY manquante');
+        }
+
+        const result = await this.model.generateContent({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig
+        });
+
+        const text = result.response.text().trim();
+        if (!text) throw new Error('Réponse Gemini vide');
+        return text;
+    }
+
+    _parseJsonObject(text) {
+        const clean = String(text).replace(/```json|```/g, '').trim();
+        const match = clean.match(/\{[\s\S]*\}/);
+        if (!match) throw new Error('JSON introuvable dans la réponse Gemini');
+        return JSON.parse(match[0]);
     }
 }
 
