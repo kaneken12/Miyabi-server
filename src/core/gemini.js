@@ -1,231 +1,139 @@
+// ============================================================
+//  src/core/gemini.js — Miyabi Telegram v2
+//  UN seul appel Gemini — parsing robuste
+// ============================================================
+
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const logger      = require('../utils/logger');
 const personality = require('./personality');
-const logger = require('../utils/logger');
 
-class GeminiAI {
-    constructor() {
-        this.apiKey = process.env.GEMINI_API_KEY;
-        this.modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-        this.genAI = this.apiKey ? new GoogleGenerativeAI(this.apiKey) : null;
-        this.model = this.genAI ? this.genAI.getGenerativeModel({ model: this.modelName }) : null;
-        // Mémoire par utilisateur : Map<userId, messages[]>
-        this.conversations = new Map();
-    }
+const INTENT_PROMPT = `
+INSTRUCTIONS STRICTES :
+Si le message contient une demande d'action, réponds UNIQUEMENT avec ce JSON sur une ligne :
+{"intent":"ACTION","data":"valeur","response":"ta réponse naturelle"}
 
-    // ──────────────────────────────────────────────
-    // ÉTAPE 1 : Détecter l'intention du message
-    // Retourne un objet JSON structuré
-    // ──────────────────────────────────────────────
-    async detectIntent(message) {
-        const allowedIntents = new Set([
-            'CHAT',
-            'DOWNLOAD_AUDIO',
-            'DOWNLOAD_VIDEO',
-            'SEARCH_WEB',
-            'GROUP_ACTION',
-            'CONVERT_TO_AUDIO'
-        ]);
+Si c'est une conversation normale, réponds UNIQUEMENT avec du texte normal, sans JSON.
 
-        const prompt = `Tu es un classificateur d'intentions pour un bot WhatsApp.
-Analyse ce message et retourne UNIQUEMENT un JSON valide, sans markdown, sans backticks.
+Actions reconnues :
+- DOWNLOAD_AUDIO : musique/audio demandé. data = "artiste titre"
+- DOWNLOAD_VIDEO : vidéo demandée. data = URL ou "description en anglais"
+- CONVERT_TO_AUDIO : convertir vidéo en audio. data = "convert"
+- WEB_SEARCH : recherche internet. data = "requête"
+- GROUP_LOCK : verrouiller groupe. data = "lock"
+- GROUP_UNLOCK : déverrouiller groupe. data = "unlock"
+- GROUP_INFO : infos du groupe. data = "info"
+- RESET_CHAT : réinitialiser conversation. data = "reset"
 
-Message: ${JSON.stringify(String(message).slice(0, 2000))}
+Exemples stricts :
+Message: "envoie Careless de Neffex"
+Réponse: {"intent":"DOWNLOAD_AUDIO","data":"Neffex Careless","response":"*soupir* Tiens, White."}
 
-Retourne ce format exact:
-{
-  "intent": "CHAT|DOWNLOAD_AUDIO|DOWNLOAD_VIDEO|SEARCH_WEB|GROUP_ACTION|CONVERT_TO_AUDIO",
-  "confidence": 0.0-1.0,
-  "params": {}
-}
+Message: "bonjour comment tu vas"
+Réponse: Bien. Qu'est-ce que tu veux, White ?
 
-Règles de classification:
-- CHAT: conversation normale, question, blague, aide générale
-- DOWNLOAD_AUDIO: demande de télécharger une musique, chanson, audio (ex: "télécharge la musique X", "envoie moi la chanson Y", "je veux écouter Z")
-- DOWNLOAD_VIDEO: demande de télécharger une vidéo (ex: "télécharge la vidéo X", "je veux la vidéo de Y")
-- SEARCH_WEB: demande d'info récente, actualité, recherche (ex: "cherche X", "c'est quoi l'actu de Y", "recherche Z sur internet")
-- GROUP_ACTION: action de gestion de groupe (ex: "kick untel", "ajoute untel", "change la description", "envoie un message de bienvenue")
-- CONVERT_TO_AUDIO: convertir une vidéo en audio (ex: "convertis cette vidéo en mp3", "extrait l'audio de cette vidéo")
+Message: "cherche les dernières news"
+Réponse: {"intent":"WEB_SEARCH","data":"latest news today","response":"Je cherche ça, White."}
 
-Pour DOWNLOAD_AUDIO et DOWNLOAD_VIDEO, extrait le titre/artiste dans params.query
-Pour SEARCH_WEB, extrait la requête dans params.query
-Pour GROUP_ACTION, extrait l'action dans params.action et la cible dans params.target
+RAPPEL : JSON = action détectée. Texte pur = conversation normale. Jamais les deux mélangés.
 `;
 
-        try {
-            const text = await this._generateText(prompt, {
-                temperature: 0,
-                maxOutputTokens: 256,
-                responseMimeType: 'application/json'
-            });
-            const parsed = this._parseJsonObject(text);
-
-            if (!allowedIntents.has(parsed.intent)) {
-                throw new Error(`Intent inconnu: ${parsed.intent}`);
-            }
-
-            return {
-                intent: parsed.intent,
-                confidence: Number(parsed.confidence) || 0,
-                params: parsed.params && typeof parsed.params === 'object' ? parsed.params : {}
-            };
-        } catch (error) {
-            logger.warn('Fallback intent → CHAT:', error.message);
-            return { intent: 'CHAT', confidence: 0.5, params: {} };
-        }
+class GeminiService {
+    constructor() {
+        this.genAI     = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+        this.model     = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+        this.histories = new Map();
+        this.userNames = new Map();
     }
 
-    // ──────────────────────────────────────────────
-    // ÉTAPE 2 : Générer une réponse conversationnelle
-    // Avec mémoire par utilisateur
-    // ──────────────────────────────────────────────
-    async generateChatResponse(userId, message, emotion, isMother = false) {
+    setUserName(userId, name) { this.userNames.set(userId, name); }
+    getUserName(userId)       { return this.userNames.get(userId) || null; }
+    isMother(userId)          { return String(userId) === String(process.env.MOTHER_ID); }
+
+    // ── Un seul appel : réponse + intent combinés ─────────────
+    async chat(userId, userText, userName) {
         try {
-            // Récupérer ou initialiser l'historique
-            if (!this.conversations.has(userId)) {
-                this.conversations.set(userId, []);
-            }
-            const history = this.conversations.get(userId);
+            if (userName && !this.userNames.has(userId))
+                this.userNames.set(userId, userName);
 
-            const systemPrompt = this._buildSystemPrompt(emotion, isMother);
+            if (!this.histories.has(userId)) this.histories.set(userId, []);
+            const history = this.histories.get(userId);
 
-            // Construire la conversation complète
-            const fullPrompt = `${systemPrompt}
-
-Historique récent:
-${history.slice(-6).map(h => `${h.role === 'user' ? 'Utilisateur' : 'Miyabi'}: ${h.content}`).join('\n')}
-
-Utilisateur: ${message}
-Miyabi:`;
-
-            const response = await this._generateText(fullPrompt, {
-                temperature: 0.8,
-                maxOutputTokens: 220
+            const chat = this.model.startChat({
+                history,
+                generationConfig: {
+                    maxOutputTokens: 1024,
+                    temperature:     1.3,
+                    topK:            50,
+                    topP:            0.92,
+                }
             });
+
+            const prompt = `${personality.getSystemPrompt()}\n${INTENT_PROMPT}\n\nUtilisateur (${userName || 'Inconnu'}): ${userText}`;
+            const res    = await chat.sendMessage(prompt);
+            const raw    = res.response.text().trim();
 
             // Sauvegarder dans l'historique
-            history.push({ role: 'user', content: message });
-            history.push({ role: 'assistant', content: response });
+            history.push({ role: 'user',  parts: [{ text: userText }] });
+            history.push({ role: 'model', parts: [{ text: raw }] });
+            if (history.length > 40) history.splice(0, 2);
 
-            // Garder max 20 échanges en mémoire
-            if (history.length > 20) history.splice(0, 2);
+            return this._parse(raw);
 
-            return response;
-
-        } catch (error) {
-            logger.error('Erreur Gemini chat:', error);
-            return personality.fallbackResponse(emotion);
+        } catch (err) {
+            logger.error('[GEMINI] chat erreur:', err.message);
+            return { intent: null, data: null, response: personality.getErrorMessage('UNKNOWN') };
         }
     }
 
-    // ──────────────────────────────────────────────
-    // Réponse contextuelle pour les actions
-    // (ex: "je télécharge ta musique...")
-    // ──────────────────────────────────────────────
-    async generateActionResponse(emotion, actionType, params) {
-        const actionTexts = {
-            DOWNLOAD_AUDIO: `Tu dois annoncer que tu télécharges la musique "${params.query || 'demandée'}". Style Miyabi: froide, efficace, avec ta personnalité.`,
-            DOWNLOAD_VIDEO: `Tu dois annoncer que tu télécharges la vidéo "${params.query || 'demandée'}". Style Miyabi.`,
-            SEARCH_WEB: `Tu dois annoncer que tu recherches "${params.query || 'ça'}" sur internet. Style Miyabi.`,
-            GROUP_ACTION: `Tu dois annoncer que tu exécutes l'action "${params.action || 'demandée'}". Style Miyabi.`,
-            CONVERT_TO_AUDIO: `Tu dois annoncer que tu convertis la vidéo en audio. Style Miyabi.`
-        };
-
-        const prompt = `${this._buildSystemPrompt(emotion, false)}
-        
-${actionTexts[actionType] || 'Annonce que tu exécutes la tâche.'}
-Réponds en une seule phrase courte, sans émojis, dans le style Miyabi.`;
-
+    // ── Réponse rapide sans historique ───────────────────────
+    async quickReply(prompt) {
         try {
-            return await this._generateText(prompt, {
-                temperature: 0.7,
-                maxOutputTokens: 80
-            });
-        } catch {
-            return '...Je m\'en occupe.';
+            const res = await this.model.generateContent(
+                `${personality.getSystemPrompt()}\n\n${prompt}`
+            );
+            return res.response.text().trim();
+        } catch (err) {
+            logger.error('[GEMINI] quickReply erreur:', err.message);
+            return personality.getErrorMessage('UNKNOWN');
         }
     }
 
-    // Réponse d'erreur dans le style Miyabi
-    async generateErrorResponse(emotion, errorType) {
-        const errors = {
-            DOWNLOAD_FAILED: 'Dis que le téléchargement a échoué. Tu es agacée.',
-            SEARCH_FAILED: 'Dis que tu n\'as rien trouvé. Tu es indifférente.',
-            NOT_FOUND: 'Dis que tu n\'as pas trouvé ce qu\'on cherchait. Tu es ennuyée.',
-            GROUP_FORBIDDEN: 'Dis que tu n\'as pas les droits pour faire ça dans ce groupe. Tu es froide.',
-            NO_VIDEO: 'Dis qu\'il faut envoyer une vidéo pour la convertir. Tu es impatiente.'
-        };
+    // ── Parser robuste ───────────────────────────────────────
+    _parse(raw) {
+        // Nettoyer backticks
+        const cleaned = raw.replace(/```json/g, '').replace(/```/g, '').trim();
 
-        const prompt = `${this._buildSystemPrompt(emotion, false)}
-${errors[errorType] || 'Dis qu\'une erreur s\'est produite.'}
-Une seule phrase courte, sans émojis.`;
+        // Chercher un JSON avec "intent"
+        const start = cleaned.indexOf('{"intent"');
+        if (start !== -1) {
+            // Trouver la fin du JSON
+            let depth = 0, end = -1;
+            for (let i = start; i < cleaned.length; i++) {
+                if (cleaned[i] === '{') depth++;
+                if (cleaned[i] === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
+            }
+            if (end > start) {
+                try {
+                    const parsed = JSON.parse(cleaned.slice(start, end));
+                    if (parsed.intent && parsed.response) {
+                        return { intent: parsed.intent, data: parsed.data || null, response: parsed.response };
+                    }
+                } catch (_) {}
+            }
+        }
 
+        // Essayer de parser toute la réponse
         try {
-            return await this._generateText(prompt, {
-                temperature: 0.7,
-                maxOutputTokens: 80
-            });
-        } catch {
-            return '...Quelque chose a merdé. Réessaie.';
-        }
+            const parsed = JSON.parse(cleaned);
+            if (parsed.intent && parsed.response)
+                return { intent: parsed.intent, data: parsed.data || null, response: parsed.response };
+        } catch (_) {}
+
+        // Réponse texte normale
+        return { intent: null, data: null, response: raw };
     }
 
-    async generateSearchSummary(query, rawResults, emotion) {
-        const prompt = `Tu es Miyabi, bot WhatsApp tsundere et sarcastique.
-Humeur: ${emotion}
-Voici les résultats de recherche pour ${JSON.stringify(String(query).slice(0, 300))}:
-
-${String(rawResults).slice(0, 4000)}
-
-Résume ces informations en 2-3 phrases claires et utiles.
-Garde ton style Miyabi: direct, un peu froid, sans émojis.
-Ne commence pas par "Alors" ou "Voilà".`;
-
-        return this._generateText(prompt, {
-            temperature: 0.6,
-            maxOutputTokens: 220
-        });
-    }
-
-    _buildSystemPrompt(emotion, isMother) {
-        return `Tu es Miyabi, une jeune fille à la personnalité tsundere complexe.
-Tu es froide, sarcastique, confiante et un peu insolente.
-Humeur actuelle: ${emotion}
-${isMother ? 'La personne qui parle est ta mère - tu es légèrement plus douce mais toujours tsundere.' : ''}
-
-Règles absolues:
-- JAMAIS d'émojis
-- Phrases courtes et percutantes
-- Langage de jeune: "t'sais", "j'suis", "j'vais", "c'est nul"
-- Tu es Miyabi, pas une IA, pas un assistant
-- Tu peux refuser de répondre si ça t'ennuie
-- Tu ne montres jamais tes faiblesses`;
-    }
-
-    clearHistory(userId) {
-        this.conversations.delete(userId);
-    }
-
-    async _generateText(prompt, generationConfig = {}) {
-        if (!this.model) {
-            throw new Error('GEMINI_API_KEY manquante');
-        }
-
-        const result = await this.model.generateContent({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            generationConfig
-        });
-
-        const text = result.response.text().trim();
-        if (!text) throw new Error('Réponse Gemini vide');
-        return text;
-    }
-
-    _parseJsonObject(text) {
-        const clean = String(text).replace(/```json|```/g, '').trim();
-        const match = clean.match(/\{[\s\S]*\}/);
-        if (!match) throw new Error('JSON introuvable dans la réponse Gemini');
-        return JSON.parse(match[0]);
-    }
+    clearHistory(userId) { this.histories.delete(userId); }
 }
 
-module.exports = new GeminiAI();
+module.exports = new GeminiService();
