@@ -4,9 +4,80 @@ const logger = require('../utils/logger');
 
 class GeminiAI {
     constructor() {
-        this.genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-        this.model = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+        // ── Charger toutes les clés API disponibles ──
+        this.apiKeys = [];
+        let i = 1;
+        while (process.env[`GEMINI_API_KEY_${i}`]) {
+            this.apiKeys.push(process.env[`GEMINI_API_KEY_${i}`]);
+            i++;
+        }
+        // Fallback sur l'ancienne variable si aucune clé numérotée
+        if (this.apiKeys.length === 0 && process.env.GEMINI_API_KEY) {
+            this.apiKeys.push(process.env.GEMINI_API_KEY);
+        }
+        if (this.apiKeys.length === 0) {
+            throw new Error('Aucune clé API Gemini trouvée dans .env');
+        }
+
+        this.currentKeyIndex = 0;
         this.conversations = new Map();
+
+        logger.info(`Gemini: ${this.apiKeys.length} clé(s) API chargée(s)`);
+        this._initModel();
+    }
+
+    _initModel() {
+        const key = this.apiKeys[this.currentKeyIndex];
+        this.genAI = new GoogleGenerativeAI(key);
+        this.model = this.genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+        logger.info(`Gemini: utilisation clé #${this.currentKeyIndex + 1}`);
+    }
+
+    // ── Rotation vers la prochaine clé disponible ──
+    _rotateKey() {
+        const nextIndex = (this.currentKeyIndex + 1) % this.apiKeys.length;
+        if (nextIndex === this.currentKeyIndex) {
+            // On a fait le tour de toutes les clés
+            logger.error('Toutes les clés API Gemini sont épuisées');
+            return false;
+        }
+        this.currentKeyIndex = nextIndex;
+        this._initModel();
+        logger.info(`Gemini: rotation vers clé #${this.currentKeyIndex + 1}`);
+        return true;
+    }
+
+    // ── Vérifier si l'erreur est un dépassement de quota ──
+    _isQuotaError(error) {
+        const msg = error.message || '';
+        return msg.includes('429') ||
+               msg.includes('quota') ||
+               msg.includes('RESOURCE_EXHAUSTED') ||
+               msg.includes('rate limit') ||
+               msg.includes('Too Many Requests');
+    }
+
+    // ── Appel Gemini avec rotation automatique ──
+    async _generateWithFallback(prompt, maxRetries = null) {
+        if (maxRetries === null) maxRetries = this.apiKeys.length;
+        let attempts = 0;
+
+        while (attempts < maxRetries) {
+            try {
+                const result = await this.model.generateContent(prompt);
+                return result.response.text().trim();
+            } catch (error) {
+                if (this._isQuotaError(error)) {
+                    logger.warn(`Quota dépassé sur clé #${this.currentKeyIndex + 1}`);
+                    const rotated = this._rotateKey();
+                    if (!rotated) return null; // Toutes les clés épuisées
+                    attempts++;
+                } else {
+                    throw error; // Autre erreur → on la propage
+                }
+            }
+        }
+        return null;
     }
 
     // ──────────────────────────────────────────────
@@ -23,9 +94,9 @@ Format exact à retourner:
 
 Valeurs possibles pour intent:
 - CHAT : conversation normale, question, blague, aide générale
-- DOWNLOAD_AUDIO : télécharger une musique ou chanson (ex: "télécharge X", "envoie la chanson Y")
-- DOWNLOAD_VIDEO : télécharger une vidéo (ex: "télécharge la vidéo X")
-- SEARCH_WEB : recherche internet, actualité (ex: "cherche X", "c'est quoi Y")
+- DOWNLOAD_AUDIO : télécharger une musique ou chanson
+- DOWNLOAD_VIDEO : télécharger une vidéo
+- SEARCH_WEB : recherche internet, actualité
 - GROUP_ACTION : gestion de groupe (kick, add, description, verrouillage)
 - CONVERT_TO_AUDIO : convertir vidéo en audio
 
@@ -34,20 +105,15 @@ Pour SEARCH_WEB: ajoute params.query avec la requête
 Pour GROUP_ACTION: ajoute params.action et params.target`;
 
         try {
-            const result = await this.model.generateContent(prompt);
-            const text = result.response.text().trim();
+            const text = await this._generateWithFallback(prompt);
+            if (!text) return { intent: 'CHAT', confidence: 0.5, params: {} };
 
-            // Nettoyage robuste : extraire uniquement le JSON
             const clean = this._extractJSON(text);
-            if (!clean) throw new Error('Pas de JSON valide dans la réponse');
+            if (!clean) throw new Error('Pas de JSON valide');
 
             const parsed = JSON.parse(clean);
-
-            // Vérifier que l'intent est valide
             const validIntents = ['CHAT','DOWNLOAD_AUDIO','DOWNLOAD_VIDEO','SEARCH_WEB','GROUP_ACTION','CONVERT_TO_AUDIO'];
-            if (!validIntents.includes(parsed.intent)) {
-                parsed.intent = 'CHAT';
-            }
+            if (!validIntents.includes(parsed.intent)) parsed.intent = 'CHAT';
 
             return parsed;
 
@@ -55,23 +121,6 @@ Pour GROUP_ACTION: ajoute params.action et params.target`;
             logger.warn('Fallback intent → CHAT:', error.message);
             return { intent: 'CHAT', confidence: 0.5, params: {} };
         }
-    }
-
-    // ──────────────────────────────────────────────
-    // Extraire le JSON d'une réponse Gemini
-    // Même si Gemini ajoute du texte autour
-    // ──────────────────────────────────────────────
-    _extractJSON(text) {
-        // Supprimer les backticks markdown
-        let clean = text.replace(/```json/gi, '').replace(/```/g, '').trim();
-
-        // Chercher le premier { et le dernier }
-        const start = clean.indexOf('{');
-        const end = clean.lastIndexOf('}');
-
-        if (start === -1 || end === -1 || end < start) return null;
-
-        return clean.substring(start, end + 1);
     }
 
     // ──────────────────────────────────────────────
@@ -93,16 +142,14 @@ ${history.slice(-6).map(h => `${h.role === 'user' ? 'Utilisateur' : 'Miyabi'}: $
 Utilisateur: ${message}
 Miyabi:`;
 
-            const result = await this.model.generateContent(fullPrompt);
-            let response = result.response.text().trim();
+            const text = await this._generateWithFallback(fullPrompt);
+            let response = text || personality.fallbackResponse(emotion);
 
-            // Sécurité : si la réponse ressemble à du JSON, ne pas l'envoyer
+            // Sécurité : si JSON retourné, fallback
             if (response.startsWith('{') || response.startsWith('[')) {
-                logger.warn('Gemini a retourné du JSON dans le chat, fallback utilisé');
                 response = personality.fallbackResponse(emotion);
             }
 
-            // Sauvegarder dans l'historique
             history.push({ role: 'user', content: message });
             history.push({ role: 'assistant', content: response });
             if (history.length > 20) history.splice(0, 2);
@@ -130,18 +177,12 @@ Miyabi:`;
         const prompt = `${this._buildSystemPrompt(emotion, false)}
 
 ${actionTexts[actionType] || 'Annonce que tu exécutes la tâche.'}
-IMPORTANT: réponds en UNE SEULE phrase courte, en français naturel, sans émojis, sans JSON, sans code.`;
+IMPORTANT: UNE seule phrase courte, en français, sans émojis, sans JSON.`;
 
         try {
-            const result = await this.model.generateContent(prompt);
-            let response = result.response.text().trim();
-
-            // Sécurité : si JSON retourné, fallback
-            if (response.startsWith('{') || response.startsWith('[')) {
-                return '...Je m\'en occupe.';
-            }
-
-            return response;
+            const text = await this._generateWithFallback(prompt);
+            if (!text || text.startsWith('{')) return '...Je m\'en occupe.';
+            return text;
         } catch {
             return '...Je m\'en occupe.';
         }
@@ -162,20 +203,23 @@ IMPORTANT: réponds en UNE SEULE phrase courte, en français naturel, sans émoj
 
         const prompt = `${this._buildSystemPrompt(emotion, false)}
 ${errors[errorType] || 'Dis qu\'une erreur s\'est produite.'}
-IMPORTANT: UNE seule phrase, en français, sans émojis, sans JSON, sans code.`;
+IMPORTANT: UNE seule phrase, en français, sans émojis, sans JSON.`;
 
         try {
-            const result = await this.model.generateContent(prompt);
-            let response = result.response.text().trim();
-
-            if (response.startsWith('{') || response.startsWith('[')) {
-                return '...Quelque chose a merdé. Réessaie.';
-            }
-
-            return response;
+            const text = await this._generateWithFallback(prompt);
+            if (!text || text.startsWith('{')) return '...Quelque chose a merdé. Réessaie.';
+            return text;
         } catch {
             return '...Quelque chose a merdé. Réessaie.';
         }
+    }
+
+    _extractJSON(text) {
+        let clean = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+        const start = clean.indexOf('{');
+        const end = clean.lastIndexOf('}');
+        if (start === -1 || end === -1 || end < start) return null;
+        return clean.substring(start, end + 1);
     }
 
     _buildSystemPrompt(emotion, isMother) {
