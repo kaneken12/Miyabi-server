@@ -4,14 +4,12 @@ const stickerHandler = require('./stickerHandler');
 const downloadService = require('../services/downloadService');
 const searchService = require('../services/searchService');
 const groupService = require('../services/groupService');
+const walletHandler = require('./walletHandler');
 const logger = require('../utils/logger');
 const fs = require('fs');
 
 class MessageHandler {
 
-    // ──────────────────────────────────────────────
-    // Point d'entrée principal
-    // ──────────────────────────────────────────────
     async handleMessage(sock, message, isGroup = false) {
         try {
             const sender = message.key.remoteJid;
@@ -20,7 +18,6 @@ class MessageHandler {
             const mentionedJids = message.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
 
             if (!messageText) {
-                // Vérifier si c'est une vidéo envoyée (pour conversion)
                 await this._handleMediaMessage(sock, message, senderNumber, isGroup, sender);
                 return;
             }
@@ -28,60 +25,61 @@ class MessageHandler {
             const isMother = personality.isMother(senderNumber);
             const isOwner = personality.isOwner(senderNumber);
 
-            // En groupe: répondre seulement si mentionné ou si "miyabi" dans le texte
             if (isGroup) {
-                const botMentioned = this._isBotMentioned(message, sock);
+                const botMentioned = this._isBotMentioned(message);
                 const nameMentioned = messageText.toLowerCase().includes('miyabi');
                 if (!botMentioned && !nameMentioned && !isMother) return;
             }
 
             logger.info(`📨 Message de ${senderNumber}: "${messageText.slice(0, 60)}"`);
 
-            // Commande admin spéciale (owner uniquement)
+            // Commandes admin spéciales
             if (isOwner && messageText.startsWith('!')) {
                 await this._handleAdminCommand(sock, sender, messageText, senderNumber);
                 return;
             }
 
-            // ── Détecter l'intention via Gemini ──
+            // Détecter l'intention
             const intentData = await gemini.detectIntent(messageText);
             logger.info(`🧠 Intention: ${intentData.intent} (confiance: ${intentData.confidence})`);
 
             const emotion = personality.getCurrentEmotion();
 
-            // Envoyer un accusé de réception pour les actions longues
-            const isLongAction = ['DOWNLOAD_AUDIO', 'DOWNLOAD_VIDEO', 'SEARCH_WEB', 'CONVERT_TO_AUDIO'].includes(intentData.intent);
+            // ── Router ──
+            // Intents wallet
+            if (intentData.intent.startsWith('WALLET_')) {
+                const action = intentData.intent.replace('WALLET_', '');
+                await walletHandler.handle(sock, sender, action, intentData.params || {}, isOwner);
+                return;
+            }
+
+            // Intents normaux avec accusé de réception
+            const isLongAction = ['DOWNLOAD_AUDIO','DOWNLOAD_VIDEO','SEARCH_WEB','CONVERT_TO_AUDIO'].includes(intentData.intent);
             if (isLongAction) {
-                const ackMsg = await gemini.generateActionResponse(emotion.name, intentData.intent, intentData.params);
+                const ackMsg = await gemini.generateActionResponse(emotion.name, intentData.intent, intentData.params || {});
                 await this._sendText(sock, sender, ackMsg);
             }
 
-            // ── Router vers le bon handler ──
             switch (intentData.intent) {
                 case 'DOWNLOAD_AUDIO':
                     await this._handleDownloadAudio(sock, sender, intentData.params, emotion);
                     break;
-
                 case 'DOWNLOAD_VIDEO':
                     await this._handleDownloadVideo(sock, sender, intentData.params, emotion);
                     break;
-
                 case 'SEARCH_WEB':
                     await this._handleSearch(sock, sender, intentData.params, emotion);
                     break;
-
                 case 'GROUP_ACTION':
                     if (isGroup) {
                         await this._handleGroupAction(sock, sender, messageText, intentData.params, mentionedJids, emotion, isOwner);
                     } else {
-                        await this._sendText(sock, sender, '...Je gère les groupes seulement dans un groupe. Logique, non ?');
+                        await this._sendText(sock, sender, '...Je gère les groupes seulement dans un groupe. Logique.');
                     }
                     break;
-
                 case 'CONVERT_TO_AUDIO':
                     await this._sendText(sock, sender, await gemini.generateErrorResponse(emotion.name, 'NO_VIDEO'));
                     break;
-
                 case 'CHAT':
                 default:
                     await this._handleChat(sock, sender, message, senderNumber, messageText, emotion, isMother);
@@ -93,19 +91,11 @@ class MessageHandler {
         }
     }
 
-    // ──────────────────────────────────────────────
-    // CHAT - Réponse conversationnelle
-    // ──────────────────────────────────────────────
     async _handleChat(sock, sender, message, senderNumber, messageText, emotion, isMother) {
         let response = await gemini.generateChatResponse(senderNumber, messageText, emotion.name, isMother);
-
-        if (isMother) {
-            response = `(｡•́︿•̀｡) ... ${response}`;
-        }
-
+        if (isMother) response = `(｡•́︿•̀｡) ... ${response}`;
         await this._sendText(sock, sender, response);
 
-        // Envoyer sticker si activé dans .env (SEND_STICKERS=true)
         const stickersEnabled = process.env.SEND_STICKERS !== 'false';
         if (stickersEnabled) {
             const stickerBuffer = await stickerHandler.getStickerBuffer(emotion.sticker);
@@ -115,18 +105,13 @@ class MessageHandler {
         }
     }
 
-    // ──────────────────────────────────────────────
-    // DOWNLOAD AUDIO
-    // ──────────────────────────────────────────────
     async _handleDownloadAudio(sock, sender, params, emotion) {
         const query = params.query;
         if (!query) {
             await this._sendText(sock, sender, 'Quel morceau tu veux ? Donne-moi un titre ou un artiste.');
             return;
         }
-
         const result = await downloadService.downloadAudio(query);
-
         if (result.success) {
             try {
                 await sock.sendMessage(sender, {
@@ -135,9 +120,7 @@ class MessageHandler {
                     fileName: result.fileName,
                     ptt: false
                 });
-                logger.info(`✅ Audio envoyé: ${result.fileName}`);
             } catch (err) {
-                logger.error('Erreur envoi audio:', err.message);
                 await this._sendText(sock, sender, await gemini.generateErrorResponse(emotion.name, 'DOWNLOAD_FAILED'));
             } finally {
                 downloadService.cleanup(result.path);
@@ -147,18 +130,13 @@ class MessageHandler {
         }
     }
 
-    // ──────────────────────────────────────────────
-    // DOWNLOAD VIDEO
-    // ──────────────────────────────────────────────
     async _handleDownloadVideo(sock, sender, params, emotion) {
         const query = params.query;
         if (!query) {
             await this._sendText(sock, sender, 'Quelle vidéo tu veux ? Donne-moi un titre ou une URL.');
             return;
         }
-
         const result = await downloadService.downloadVideo(query);
-
         if (result.success) {
             try {
                 await sock.sendMessage(sender, {
@@ -166,9 +144,7 @@ class MessageHandler {
                     mimetype: 'video/mp4',
                     fileName: result.fileName
                 });
-                logger.info(`✅ Vidéo envoyée: ${result.fileName}`);
             } catch (err) {
-                logger.error('Erreur envoi vidéo:', err.message);
                 await this._sendText(sock, sender, await gemini.generateErrorResponse(emotion.name, 'DOWNLOAD_FAILED'));
             } finally {
                 downloadService.cleanup(result.path);
@@ -178,18 +154,13 @@ class MessageHandler {
         }
     }
 
-    // ──────────────────────────────────────────────
-    // SEARCH WEB
-    // ──────────────────────────────────────────────
     async _handleSearch(sock, sender, params, emotion) {
         const query = params.query;
         if (!query) {
             await this._sendText(sock, sender, 'Tu cherches quoi exactement ?');
             return;
         }
-
         const rawResults = await searchService.search(query);
-
         if (rawResults) {
             const formatted = await searchService.formatResultsWithAI(query, rawResults, gemini, emotion.name);
             await this._sendText(sock, sender, formatted || rawResults.slice(0, 1000));
@@ -198,46 +169,29 @@ class MessageHandler {
         }
     }
 
-    // ──────────────────────────────────────────────
-    // GROUP ACTION
-    // ──────────────────────────────────────────────
     async _handleGroupAction(sock, groupId, messageText, params, mentionedJids, emotion, isOwner) {
-        // Vérifier si le bot est admin
         const botIsAdmin = await groupService.isBotAdmin(sock, groupId);
         if (!botIsAdmin) {
             await this._sendText(sock, groupId, 'Je suis pas admin ici. Donne-moi les droits d\'abord.');
             return;
         }
-
         const actionData = groupService.parseGroupAction(params, messageText);
         const result = await groupService.executeAction(sock, groupId, actionData, mentionedJids);
-
         if (result.success) {
-            if (result.action === 'WELCOME_MSG') {
-                await this._sendText(sock, groupId, 'Message de bienvenue activé. Je vais accueillir les nouveaux membres... à ma façon.');
-            } else {
-                // Réponse Miyabi courte après action réussie
-                await this._sendText(sock, groupId, 'Fait. De rien.');
-            }
+            await this._sendText(sock, groupId, 'Fait. De rien.');
         } else {
             await this._sendText(sock, groupId, await gemini.generateErrorResponse(emotion.name, result.error || 'GROUP_FORBIDDEN'));
         }
     }
 
-    // ──────────────────────────────────────────────
-    // MEDIA REÇU (vidéo pour conversion)
-    // ──────────────────────────────────────────────
     async _handleMediaMessage(sock, message, senderNumber, isGroup, sender) {
         const videoMsg = message.message?.videoMessage;
         if (!videoMsg) return;
 
-        // Vérifier si c'est une demande de conversion (caption ou contexte)
         const caption = videoMsg.caption || '';
         const wantsConvert = caption.toLowerCase().includes('mp3') ||
                              caption.toLowerCase().includes('audio') ||
-                             caption.toLowerCase().includes('convertis') ||
-                             caption.toLowerCase().includes('extrait');
-
+                             caption.toLowerCase().includes('convertis');
         if (!wantsConvert) return;
 
         const emotion = personality.getCurrentEmotion();
@@ -263,17 +217,13 @@ class MessageHandler {
                 await this._sendText(sock, sender, await gemini.generateErrorResponse(emotion.name, 'DOWNLOAD_FAILED'));
             }
         } catch (err) {
-            logger.error('Erreur conversion vidéo reçue:', err.message);
+            logger.error('Erreur conversion vidéo:', err.message);
             await this._sendText(sock, sender, await gemini.generateErrorResponse(emotion.name, 'DOWNLOAD_FAILED'));
         }
     }
 
-    // ──────────────────────────────────────────────
-    // COMMANDES ADMIN (owner uniquement, préfixe !)
-    // ──────────────────────────────────────────────
     async _handleAdminCommand(sock, sender, text, senderNumber) {
         const cmd = text.slice(1).trim().toLowerCase();
-
         if (cmd === 'reset') {
             gemini.clearHistory(senderNumber);
             await this._sendText(sock, sender, 'Mémoire effacée.');
@@ -281,27 +231,22 @@ class MessageHandler {
             const emotion = cmd.replace('humeur ', '');
             const ok = personality.setEmotion(emotion);
             await this._sendText(sock, sender, ok ? `Humeur changée: ${emotion}` : 'Humeur inconnue.');
+        } else if (cmd === 'groupid') {
+            await this._sendText(sock, sender, `ID du groupe: ${sender}`);
         } else {
             await this._sendText(sock, sender, 'Commande inconnue.');
         }
     }
 
-    // ── Helpers ──
     _extractText(message) {
         return message.message?.conversation ||
                message.message?.extendedTextMessage?.text ||
-               message.message?.imageMessage?.caption ||
-               '';
+               message.message?.imageMessage?.caption || '';
     }
 
-    _isBotMentioned(message, sock) {
+    _isBotMentioned(message) {
         const mentioned = message.message?.extendedTextMessage?.contextInfo?.mentionedJid;
-        if (!mentioned) return false;
-
-        const botJid = sock.user?.id?.split(':')[0];
-        if (!botJid) return false;
-
-        return mentioned.some((jid) => jid.split(':')[0] === botJid);
+        return mentioned && mentioned.length > 0;
     }
 
     async _sendText(sock, jid, text) {
