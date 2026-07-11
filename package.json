@@ -19,7 +19,6 @@
     "fluent-ffmpeg": "^2.1.2",
     "node-cache": "^5.1.2",
     "pino": "^8.17.2",
-    "sharp": "^0.33.1",
     "socket.io": "^4.6.1",
     "yt-dlp-wrap": "^2.3.12"
   },
