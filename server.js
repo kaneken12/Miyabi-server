@@ -7,7 +7,6 @@ const path = require('path');
 
 const SessionManager = require('./src/core/sessionManager');
 const { router: apiRouter, setSessionManager } = require('./src/routes/api');
-const walletService = require('./src/services/walletService');
 
 const app = express();
 const server = http.createServer(app);
@@ -25,6 +24,7 @@ setSessionManager(sessionManager);
 setInterval(() => sessionManager.cleanupStaleSessions(), 300000);
 
 app.use('/api', apiRouter);
+
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
@@ -45,19 +45,8 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-
-// Connecter MongoDB puis démarrer le serveur
-walletService.connect().then(() => {
-    server.listen(PORT, () => {
-        console.log(`\n🎀 Miyabi Server démarré`);
-        console.log(`🌐 Interface: http://localhost:${PORT}`);
-        console.log(`📡 API: http://localhost:${PORT}/api\n`);
-    });
-}).catch(err => {
-    console.error('Erreur MongoDB:', err.message);
-    // Démarrer quand même sans MongoDB
-    server.listen(PORT, () => {
-        console.log(`\n🎀 Miyabi Server démarré (sans MongoDB)`);
-        console.log(`🌐 Interface: http://localhost:${PORT}\n`);
-    });
+server.listen(PORT, () => {
+    console.log(`\n🎀 Miyabi Server démarré`);
+    console.log(`🌐 Interface: http://localhost:${PORT}`);
+    console.log(`📡 API: http://localhost:${PORT}/api\n`);
 });
