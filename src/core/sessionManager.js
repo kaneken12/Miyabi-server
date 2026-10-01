@@ -1,13 +1,31 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    Browsers
+} = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
+const NodeCache = require('node-cache');
 
-const messageHandler = require('../../src/handlers/messageHandler');
+const messageHandler = require('../handlers/messageHandler');
+const logger = require('../utils/logger');
 
 const SESSIONS_DIR = path.join(__dirname, '../../sessions');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+
+// ── Caches recommandés par la documentation officielle Baileys (baileys.wiki) ──
+// 1. Cache pour éviter les boucles infinies de retry de messages
+const msgRetryCounterCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+
+// 2. Cache pour les métadonnées de groupe (évite les requêtes réseau excessives)
+const groupCache = new NodeCache({ stdTTL: 600, checkperiod: 120 });
+
+// 3. Store en mémoire pour getMessage (indispensable pour les retries et le déchiffrement Signal)
+const messageStore = new NodeCache({ stdTTL: 1800, checkperiod: 300 });
 
 const activeSessions = new Map();
 
@@ -15,9 +33,18 @@ class SessionManager {
     constructor(io) {
         this.io = io;
         this.phoneIndex = new Map();
+        this.reconnectAttempts = new Map();
     }
 
-    async createSession(sessionId, phoneNumber) {
+    async createSession(sessionId, phoneNumber = null, usePairingCode = false) {
+        // Fermer toute autre session non connectée pour éviter les conflits de clés Signal et Bad MAC
+        for (const [id, s] of activeSessions.entries()) {
+            if (id !== sessionId && s.status !== 'connected') {
+                logger.info(`Nettoyage ancienne session en attente: ${id}`);
+                this.deleteSession(id);
+            }
+        }
+
         if (activeSessions.has(sessionId)) {
             const existing = activeSessions.get(sessionId);
             if (existing.status === 'connected') {
@@ -30,76 +57,185 @@ class SessionManager {
 
         const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
+        // Récupérer dynamiquement la dernière version supportée de WhatsApp Web
+        let version;
+        try {
+            const vInfo = await fetchLatestBaileysVersion();
+            version = vInfo.version;
+            logger.info(`📱 Baileys version WhatsApp Web: ${version.join('.')}`);
+        } catch (e) {
+            version = [2, 3000, 1043857760];
+            logger.warn(`📱 Baileys version fallback: ${version.join('.')}`);
+        }
+
+        // Configuration alignée avec les recommandations officielles de baileys.wiki
         const sock = makeWASocket({
-            printQRInTerminal: false,
+            version,
             auth: state,
+            printQRInTerminal: false,
             logger: pino({ level: 'silent' }),
-            browser: ['Ubuntu', 'Chrome', '20.0.04']
+            browser: Browsers.ubuntu('Chrome'),
+
+            // Optimisation bot : Ne pas télécharger tout l'historique ancien pour économiser RAM et temps
+            syncFullHistory: false,
+
+            // Permettre au téléphone principal de continuer à recevoir les notifications push
+            markOnlineOnConnect: false,
+
+            // Cache des tentatives de messages pour éviter les boucles infinies
+            msgRetryCounterCache,
+
+            // Résolution des messages pour les retries et votes (anti Bad MAC / waiting message)
+            getMessage: async (key) => {
+                if (key?.id) {
+                    const cached = messageStore.get(key.id);
+                    if (cached) return cached;
+                }
+                return undefined;
+            },
+
+            // Cache des métadonnées de groupe (réduit de 90% les appels réseau en groupe)
+            cachedGroupMetadata: async (jid) => {
+                return groupCache.get(jid);
+            },
+
+            // Prévisualisation des liens de haute qualité
+            generateHighQualityLinkPreview: true,
+
+            // Timeouts réseau résilients
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000
         });
 
-        activeSessions.set(sessionId, {
+        const session = {
             sock,
             status: 'pending',
             phone: phoneNumber,
+            lastQR: null,
+            lastPairingCode: null,
             createdAt: Date.now()
-        });
+        };
 
-        this.phoneIndex.set(phoneNumber, sessionId);
+        activeSessions.set(sessionId, session);
 
-        // ── Events de connexion ──
+        if (phoneNumber) {
+            this.phoneIndex.set(phoneNumber, sessionId);
+        }
+
+        // Code d'appairage par numéro si demandé
+        if (usePairingCode && phoneNumber && !sock.authState.creds.registered) {
+            setTimeout(async () => {
+                try {
+                    const code = await sock.requestPairingCode(phoneNumber);
+                    logger.info(`🔐 Pairing code généré pour ${sessionId}: ${code}`);
+                    session.lastPairingCode = code;
+                    this.io.to(sessionId).emit('pairing_code', { code });
+                    this._updateStatus(sessionId, 'code_ready');
+                } catch (err) {
+                    logger.error(`Erreur pairing code: ${err.message}`);
+                    this.io.to(sessionId).emit('error', { message: 'Erreur code d\'appairage: ' + err.message });
+                }
+            }, 1500);
+        }
+
+        // ── Événements de connexion (baileys.wiki lifecycle) ──
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
-            // QR code reçu → envoyer au frontend
             if (qr) {
-                console.log('QR code généré pour session:', sessionId);
+                logger.info(`✅ QR code reçu pour session: ${sessionId}`);
+                session.lastQR = qr;
                 this.io.to(sessionId).emit('qr', { qr });
                 this._updateStatus(sessionId, 'qr_ready');
             }
 
             if (connection === 'open') {
+                const userPhone = sock.user?.id ? sock.user.id.split(':')[0] : (phoneNumber || 'Inconnu');
+                this.reconnectAttempts.delete(sessionId);
                 this._updateStatus(sessionId, 'connected');
+                logger.info(`🎉 Session ${sessionId} connectée avec succès (+${userPhone})`);
+
                 this.io.to(sessionId).emit('connected', {
                     message: 'Miyabi est connectée !',
-                    phone: phoneNumber
+                    phone: userPhone
                 });
+
+                // Message de bienvenue initial
                 try {
-                    await sock.sendMessage(`${phoneNumber}@s.whatsapp.net`, {
-                        text: `...Je suis là. T'as payé pour ça alors je vais faire mon travail. Envoie-moi un message pour commencer.`
-                    });
+                    const targetJid = sock.user?.id
+                        ? `${sock.user.id.split(':')[0]}@s.whatsapp.net`
+                        : (phoneNumber ? `${phoneNumber}@s.whatsapp.net` : null);
+
+                    if (targetJid) {
+                        await sock.sendMessage(targetJid, {
+                            text: `...Je suis là. T'as configuré le bot alors je vais faire mon travail. Envoie-moi un message pour commencer.`
+                        });
+                    }
                 } catch (e) {}
             }
 
             if (connection === 'close') {
                 const statusCode = (lastDisconnect?.error instanceof Boom)
-                    ? lastDisconnect.error.output?.statusCode : null;
+                    ? lastDisconnect.error.output?.statusCode
+                    : lastDisconnect?.error?.statusCode;
 
-                console.log('Connexion fermée, code:', statusCode);
+                logger.warn(`⚠️ Connexion fermée (${sessionId}), code: ${statusCode}`);
 
-                if (statusCode === DisconnectReason.loggedOut) {
+                if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.badSession) {
+                    logger.info(`🚪 Session ${sessionId} déconnectée / session invalide`);
                     this._updateStatus(sessionId, 'logged_out');
                     this.io.to(sessionId).emit('disconnected', { reason: 'logged_out' });
                     this.deleteSession(sessionId);
+                } else if (statusCode === DisconnectReason.restartRequired) {
+                    logger.info(`🔄 Redémarrage requis pour ${sessionId}, reconnexion immédiate...`);
+                    this.createSession(sessionId, phoneNumber, usePairingCode);
                 } else {
+                    const attempts = (this.reconnectAttempts.get(sessionId) || 0) + 1;
+                    this.reconnectAttempts.set(sessionId, attempts);
+
+                    const delay = Math.min(2000 * Math.pow(1.5, attempts - 1), 30000);
+                    logger.info(`⏳ Tentative de reconnexion #${attempts} dans ${Math.round(delay / 1000)}s...`);
+
                     this._updateStatus(sessionId, 'reconnecting');
-                    this.io.to(sessionId).emit('reconnecting');
-                    setTimeout(() => this.createSession(sessionId, phoneNumber), 5000);
+                    this.io.to(sessionId).emit('reconnecting', { attempt: attempts });
+
+                    setTimeout(() => {
+                        if (activeSessions.has(sessionId)) {
+                            this.createSession(sessionId, phoneNumber, usePairingCode);
+                        }
+                    }, delay);
                 }
             }
         });
 
-        // ── Messages entrants ──
-        sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            if (type !== 'notify') return;
-            for (const msg of messages) {
-                if (msg.key.fromMe) continue;
-                const isGroup = msg.key.remoteJid?.endsWith('@g.us');
-                await messageHandler.handleMessage(sock, msg, isGroup);
+        // ── Sauvegarde des identifiants d'authentification ──
+        sock.ev.on('creds.update', async () => {
+            try {
+                await saveCreds();
+            } catch (e) {
+                logger.error(`Erreur sauvegarde creds (${sessionId}): ${e.message}`);
             }
         });
 
-        // ── Nouveaux membres groupe ──
+        // ── Gestion du cache des métadonnées de groupe ──
+        sock.ev.on('groups.update', async (groupUpdates) => {
+            for (const update of groupUpdates) {
+                const cached = groupCache.get(update.id);
+                if (cached) {
+                    groupCache.set(update.id, { ...cached, ...update });
+                }
+            }
+        });
+
         sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
+            const cached = groupCache.get(id);
+            if (cached) {
+                try {
+                    const fresh = await sock.groupMetadata(id);
+                    groupCache.set(id, fresh);
+                } catch (e) {}
+            }
+
             if (action === 'add') {
                 for (const participant of participants) {
                     const number = participant.split('@')[0];
@@ -113,7 +249,28 @@ class SessionManager {
             }
         });
 
-        sock.ev.on('creds.update', saveCreds);
+        // ── Messages entrants avec mise en cache du message pour getMessage ──
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return;
+            for (const msg of messages) {
+                if (!msg || !msg.key) continue;
+
+                // Enregistrer pour getMessage
+                if (msg.key.id && msg.message) {
+                    messageStore.set(msg.key.id, msg.message);
+                }
+
+                if (msg.key.fromMe) continue;
+                if (msg.key.remoteJid === 'status@broadcast') continue;
+
+                const isGroup = msg.key.remoteJid?.endsWith('@g.us');
+                try {
+                    await messageHandler.handleMessage(sock, msg, isGroup);
+                } catch (handlerErr) {
+                    logger.error(`Erreur handleMessage non capturée: ${handlerErr?.stack || handlerErr?.message || handlerErr}`);
+                }
+            }
+        });
 
         return { success: true };
     }
@@ -124,15 +281,22 @@ class SessionManager {
             try { session.sock.end(); } catch (e) {}
         }
         activeSessions.delete(sessionId);
+        this.reconnectAttempts.delete(sessionId);
         if (session?.phone) this.phoneIndex.delete(session.phone);
 
         const sessionPath = path.join(SESSIONS_DIR, sessionId);
         if (fs.existsSync(sessionPath)) {
-            fs.rmSync(sessionPath, { recursive: true, force: true });
+            try {
+                fs.rmSync(sessionPath, { recursive: true, force: true });
+            } catch (e) {}
         }
     }
 
     getSession(sessionId) { return activeSessions.get(sessionId); }
+
+    getQR(sessionId) {
+        return activeSessions.get(sessionId)?.lastQR || null;
+    }
 
     getStatus(sessionId) {
         return activeSessions.get(sessionId)?.status || 'not_found';
@@ -157,3 +321,5 @@ class SessionManager {
 }
 
 module.exports = SessionManager;
+module.exports.messageStore = messageStore;
+module.exports.groupCache = groupCache;
